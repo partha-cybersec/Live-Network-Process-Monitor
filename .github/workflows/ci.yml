@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.9", "3.12"]
+    runs-on: ${{ matrix.os }}
+    env:
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+      - run: pytest -q
+      - name: Smoke test (one snapshot)
+        run: python -m lnpm --once --top 5
+      - name: Smoke test (legacy script name + baseline round trip)
+        run: |
+          python Live_Network_Process_Monitor.py --once --top 3
+          python -m lnpm --save-baseline baseline.json
+          python -m lnpm --once --top 3 --baseline baseline.json
