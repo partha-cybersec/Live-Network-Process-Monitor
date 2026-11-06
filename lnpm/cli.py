@@ -16,11 +16,39 @@ from .core import (
     listeners,
     load_baseline,
     new_listeners,
+    pids_listening_on,
     prime_cpu,
     save_baseline,
     snapshot,
     top,
 )
+
+
+def non_negative_int(text: str) -> int:
+    value = int(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return value
+
+
+def positive_float(text: str) -> float:
+    value = float(text)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be more than 0")
+    return value
+
+
+def shorten(listening: str, limit: int = 40) -> str:
+    """Fit the table without hiding that ports were left out."""
+    if len(listening) <= limit:
+        return listening
+    parts = listening.split(", ")
+    kept = []
+    for part in parts:
+        if len(", ".join([*kept, part])) > limit:
+            break
+        kept.append(part)
+    return f"{', '.join(kept)} +{len(parts) - len(kept)} more"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -31,8 +59,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("-s", "--sort", choices=sorted(SORT_KEYS), default="cpu",
                    help="sort column (default: cpu)")
-    p.add_argument("-n", "--top", type=int, default=15, help="rows to show, 0 = all (default: 15)")
-    p.add_argument("-i", "--interval", type=float, default=2.0, help="refresh seconds (default: 2)")
+    p.add_argument("-n", "--top", type=non_negative_int, default=15,
+                   help="rows to show, 0 = all (default: 15)")
+    p.add_argument("-i", "--interval", type=positive_float, default=2.0,
+                   help="seconds to wait between refreshes (default: 2)")
     p.add_argument("-f", "--filter", help="only show processes whose name contains this text")
     p.add_argument("--once", action="store_true", help="print one snapshot and exit")
     p.add_argument("--cpu-warn", type=float, default=50.0, help="highlight CPU %% at or above (default: 50)")
@@ -43,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--baseline", metavar="FILE",
                    help="flag processes listening on ports that are not in this baseline")
     p.add_argument("--export", metavar="FILE",
-                   help="write the snapshot to FILE (.csv or .json) and exit")
+                   help="write the snapshot to FILE and exit (.json = JSON, anything else = CSV)")
     return p
 
 
@@ -75,7 +105,7 @@ def render(rows, args, unexpected, new_items, total):
         flags = flags_for(p, args.cpu_warn, args.mem_warn, unexpected)
         style = "red" if "new-listener" in flags else ("yellow" if flags else "")
         table.add_row(str(p.pid), p.name[:24], p.user[:14], f"{p.cpu:.1f}", f"{p.memory_mb:.1f}",
-                      str(p.connections), p.listening[:30], " ".join(flags), style=style)
+                      str(p.connections), shorten(p.listening), " ".join(flags), style=style)
     if not args.once:
         console.clear()
     console.print(table)
@@ -108,11 +138,12 @@ def main(argv=None) -> int:
         while True:
             procs = snapshot()
             new_items = new_listeners(listeners(procs), baseline) if baseline is not None else []
-            unexpected = {item.process.lower() for item in new_items}
+            unexpected = pids_listening_on(procs, new_items)
             rows = top(procs, args.sort, args.top, args.filter)
             if args.export:
                 try:
-                    export(args.export, rows)
+                    export(args.export, rows,
+                           lambda p, pids=unexpected: flags_for(p, args.cpu_warn, args.mem_warn, pids))
                 except OSError as exc:
                     print(f"Error: cannot write {args.export}: {exc}", file=sys.stderr)
                     return 2

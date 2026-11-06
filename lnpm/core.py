@@ -8,7 +8,7 @@ import os
 import socket
 from collections import Counter
 from dataclasses import asdict, dataclass
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 SORT_KEYS = {
     "cpu": lambda p: p.cpu,
@@ -31,8 +31,12 @@ class ProcInfo:
 
     @property
     def listening(self) -> str:
-        """Human-readable, e.g. 'tcp/445, tcp/127.0.0.1:8080' (wildcard addresses omitted)."""
-        return ", ".join(f"{p}/{n}" if a in WILDCARDS else f"{p}/{a}:{n}" for p, a, n in self.listen)
+        """Human-readable, e.g. 'tcp/445, tcp/127.0.0.1:8080' (wildcard addresses omitted).
+
+        IPv4 and IPv6 wildcards look the same here, so duplicates are dropped.
+        """
+        items = (f"{p}/{n}" if a in WILDCARDS else f"{p}/{a}:{n}" for p, a, n in self.listen)
+        return ", ".join(dict.fromkeys(items))
 
     def as_row(self) -> dict:
         row = asdict(self)
@@ -73,7 +77,7 @@ def read_sockets(psutil_mod) -> tuple[Counter, dict]:
     except psutil_mod.AccessDenied:
         return counts, listening
     for c in conns:
-        if c.pid is None:
+        if not c.pid:  # None = unknown owner; 0 = closed sockets kept by the OS (TIME_WAIT)
             continue
         is_listen = (c.status == psutil_mod.CONN_LISTEN) or (
             _proto(c.type) == "udp" and not c.raddr)
@@ -96,6 +100,8 @@ def snapshot(psutil_mod=None) -> list[ProcInfo]:
         info = proc.info
         mem = info.get("memory_info")
         pid = info["pid"]
+        if pid == 0:  # Windows "System Idle Process": its CPU % is idle time, not work
+            continue
         ports = tuple(sorted(listening.get(pid, ()), key=lambda x: (x[0], x[2], x[1])))
         out.append(ProcInfo(
             pid=pid,
@@ -167,25 +173,36 @@ def new_listeners(current: set[Listener], baseline: set[str]) -> list[Listener]:
                   key=lambda x: (x.port, x.process, x.address))
 
 
+def pids_listening_on(procs: Iterable[ProcInfo], items: Iterable[Listener]) -> set[int]:
+    """PIDs that own these listeners. Other processes with the same name are not included."""
+    wanted = set(items)
+    return {p.pid for p in procs
+            if any(Listener(p.name, proto, address, port) in wanted for proto, address, port in p.listen)}
+
+
 def flags_for(p: ProcInfo, cpu_warn: float, mem_warn: float,
-              unexpected: set[str]) -> list[str]:
+              unexpected_pids: set[int]) -> list[str]:
     flags = []
-    if p.cpu >= cpu_warn:
+    # This tool's own scan is the busiest moment of its life, so do not report it as a finding.
+    if p.cpu >= cpu_warn and p.pid != os.getpid():
         flags.append("high-cpu")
     if p.memory_mb >= mem_warn:
         flags.append("high-mem")
-    if p.name.lower() in unexpected:
+    if p.pid in unexpected_pids:
         flags.append("new-listener")
     return flags
 
 
-def export(path: str, procs: list[ProcInfo]) -> None:
+def export(path: str, procs: list[ProcInfo], flags_of: Optional[Callable] = None) -> None:
+    """Write CSV, or JSON if the name ends in .json. ``flags_of(proc)`` fills the flags column."""
     rows = [p.as_row() for p in procs]
+    for proc, row in zip(procs, rows):
+        row["flags"] = " ".join(flags_of(proc)) if flags_of else ""
     if path.lower().endswith(".json"):
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(rows, fh, indent=2)
         return
-    fields = list(ProcInfo.__dataclass_fields__)
+    fields = [*ProcInfo.__dataclass_fields__, "flags"]
     with open(path, "w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields)
         writer.writeheader()
